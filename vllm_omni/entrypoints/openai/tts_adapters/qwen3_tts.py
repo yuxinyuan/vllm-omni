@@ -290,6 +290,12 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                     "CustomVoice requires a 'voice' parameter when no default speaker "
                     "is configured. Supported: " + ", ".join(sorted(available_speakers))
                 )
+            if request.ref_audio is not None or request.ref_text is not None:
+                if request.ref_audio is None or not request.ref_text or not request.ref_text.strip():
+                    return "CustomVoice continuation requires both 'ref_audio' and non-empty 'ref_text'"
+                fmt_err = server._validate_ref_audio_format(request.ref_audio)
+                if fmt_err:
+                    return fmt_err
 
         # Validate speaker_embedding constraints
         if request.speaker_embedding is not None:
@@ -358,8 +364,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
-            if request.ref_text is not None:
-                return "'ref_text' is only valid for Base task"
+            if task_type != "CustomVoice" and request.ref_text is not None:
+                return "'ref_text' is only valid for Base or CustomVoice continuation"
             if request.x_vector_only_mode is not None:
                 return "'x_vector_only_mode' is only valid for Base task"
 

@@ -126,6 +126,12 @@ def first_value(value: object, default: object = None) -> object:
     return value if value is not None else default
 
 
+def _is_custom_voice_continuation(info: Mapping[str, Any]) -> bool:
+    return first_value(info.get("task_type"), "CustomVoice") == "CustomVoice" and (
+        first_value(info.get("ref_audio")) is not None and first_value(info.get("ref_text")) is not None
+    )
+
+
 def coerce_ref_code_tensor(value: object, *, device: torch.device) -> torch.Tensor | None:
     value = first_value(value)
     if value is None:
@@ -425,7 +431,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         Only for plain text with no instruct, where the prompt is the cached
         pieces around the projected text.
         """
-        if not isinstance(text, str) or text[:1].isspace():
+        if _is_custom_voice_continuation(info_dict) or not isinstance(text, str) or text[:1].isspace():
             return None
         instruct = (info_dict.get("instruct") or [""])[0]
         if isinstance(instruct, str) and instruct.strip():
@@ -903,6 +909,14 @@ class Qwen3TTSPromptEmbedsBuilder:
             raise ValueError("encode_ref_audio_batch returned no codes")
         return codes[0]
 
+    def _continuation_ref_code(self, info: dict[str, Any], device: torch.device) -> torch.Tensor:
+        code = coerce_ref_code_tensor(info.get("codes", {}).get(PRECOMPUTED_REF_CODE_KEY), device=device)
+        if code is not None:
+            return code
+        normalized = info.pop(NORMALIZED_REF_AUDIO_KEY, None)
+        wav, sr = normalized if normalized is not None else self.normalize_ref_audio(first_value(info.get("ref_audio")))
+        return self.encode_ref_audio_to_code(wav, sr).to(device=device, dtype=torch.long)
+
     # -------------------- batched preprocess (cross-request) --------------------
 
     @staticmethod
@@ -945,7 +959,9 @@ class Qwen3TTSPromptEmbedsBuilder:
     def _needs_batched_ref_code(self, info_dict: dict[str, Any]) -> bool:
         if not self._needs_initial_prompt_preprocess(info_dict):
             return False
-        if first_value(info_dict.get("task_type"), "CustomVoice") != "Base":
+        if first_value(info_dict.get("task_type"), "CustomVoice") != "Base" and not _is_custom_voice_continuation(
+            info_dict
+        ):
             return False
         codes = info_dict.get("codes")
         if isinstance(codes, dict) and self._has_ref_code_like(codes.get(PRECOMPUTED_REF_CODE_KEY)):
@@ -1006,9 +1022,9 @@ class Qwen3TTSPromptEmbedsBuilder:
         pending_ref_text: list[tuple[dict[str, Any], str]] = []
         groups: dict[int, list[tuple[dict[str, Any], np.ndarray, int]]] = {}
         for info_dict in req_infos:
-            if (
-                self._needs_initial_prompt_preprocess(info_dict)
-                and first_value(info_dict.get("task_type"), "CustomVoice") == "Base"
+            if self._needs_initial_prompt_preprocess(info_dict) and (
+                first_value(info_dict.get("task_type"), "CustomVoice") == "Base"
+                or _is_custom_voice_continuation(info_dict)
             ):
                 if PRECOMPUTED_TEXT_IDS_KEY not in info_dict:
                     text = first_value(info_dict.get("text"), "")
@@ -1025,7 +1041,8 @@ class Qwen3TTSPromptEmbedsBuilder:
             ref_audio_list = info_dict.get("ref_audio")
             if not isinstance(ref_audio_list, list) or not ref_audio_list:
                 continue
-            cache_key_from_serving = first_value(info_dict.get(REF_AUDIO_CACHE_KEY))
+            use_ref_cache = not _is_custom_voice_continuation(info_dict)
+            cache_key_from_serving = first_value(info_dict.get(REF_AUDIO_CACHE_KEY)) if use_ref_cache else None
             if isinstance(cache_key_from_serving, str) and cache_key_from_serving:
                 cached = self.get_ref_audio_artifacts(cache_key_from_serving)
                 if cached is not None:
@@ -1040,14 +1057,15 @@ class Qwen3TTSPromptEmbedsBuilder:
                 # invalid ref_audio errors with its existing messages.
                 continue
             info_dict[NORMALIZED_REF_AUDIO_KEY] = (wav, sr)
-            cache_key = self.make_ref_audio_cache_key(wav, sr)
-            info_dict[REF_AUDIO_CACHE_KEY] = cache_key
-            cached = self.get_ref_audio_artifacts(cache_key)
-            if cached is not None:
-                cached_ref_code = coerce_ref_code_tensor(cached.get("ref_code"), device=device)
-                if isinstance(cached_ref_code, torch.Tensor):
-                    info_dict.setdefault("codes", {})[PRECOMPUTED_REF_CODE_KEY] = cached_ref_code
-                    continue
+            if use_ref_cache:
+                cache_key = self.make_ref_audio_cache_key(wav, sr)
+                info_dict[REF_AUDIO_CACHE_KEY] = cache_key
+                cached = self.get_ref_audio_artifacts(cache_key)
+                if cached is not None:
+                    cached_ref_code = coerce_ref_code_tensor(cached.get("ref_code"), device=device)
+                    if isinstance(cached_ref_code, torch.Tensor):
+                        info_dict.setdefault("codes", {})[PRECOMPUTED_REF_CODE_KEY] = cached_ref_code
+                        continue
             groups.setdefault(int(sr), []).append((info_dict, wav, int(sr)))
 
         if pending_text or pending_ref_text:
@@ -1101,9 +1119,10 @@ class Qwen3TTSPromptEmbedsBuilder:
                     continue
                 info_dict.setdefault("codes", {})[PRECOMPUTED_REF_CODE_KEY] = ref_code_t
                 info_dict[NORMALIZED_REF_AUDIO_KEY] = (wav, item_sr)
-                cache_key = info_dict.get(REF_AUDIO_CACHE_KEY)
-                if isinstance(cache_key, str) and cache_key:
-                    self.put_ref_audio_artifacts(cache_key, ref_code=ref_code_t)
+                if not _is_custom_voice_continuation(info_dict):
+                    cache_key = info_dict.get(REF_AUDIO_CACHE_KEY)
+                    if isinstance(cache_key, str) and cache_key:
+                        self.put_ref_audio_artifacts(cache_key, ref_code=ref_code_t)
 
         self._batched_text_embeds = self._project_texts_batch(req_infos)
 
@@ -1125,6 +1144,8 @@ class Qwen3TTSPromptEmbedsBuilder:
                 continue
             task_type = first_value(info_dict.get("task_type"), "CustomVoice")
             if task_type not in ("CustomVoice", "VoiceDesign") or not self._non_streaming_mode(info_dict, task_type):
+                continue
+            if _is_custom_voice_continuation(info_dict):
                 continue
             ids = first_value(info_dict.get(PRECOMPUTED_TEXT_IDS_KEY))
             if isinstance(ids, torch.Tensor) and ids.device.type == "cpu":
@@ -1231,10 +1252,10 @@ class Qwen3TTSPromptEmbedsBuilder:
             * ``trailing_text_hidden``: ``[T, hidden]`` queue of text-side
                     embeddings consumed one-per-decode-step (streaming mode)
                     or a single pad row (non-streaming).
-            * ``ref_code_len``: Number of ref codec frames consumed when the
-                    Base task ran in in-context mode (``None`` otherwise).
+            * ``ref_code_len``: Number of ref codec frames consumed by Base
+                    ICL or CustomVoice continuation (``None`` otherwise).
             * ``ref_code``: The ``[T, Q]`` ref codec tensor used for ICL
-                    (``None`` outside Base / ICL).
+                    or continuation (``None`` without reference conditioning).
         """
         config = self._config
         talker_config = self._talker_config
@@ -1245,6 +1266,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         text = (info_dict.get("text") or [""])[0]
         language = (info_dict.get("language") or ["Auto"])[0]
         non_streaming_mode = self._non_streaming_mode(info_dict, task_type)
+        continuation = task_type == "CustomVoice" and _is_custom_voice_continuation(info_dict)
         if task_type == "CustomVoice" and non_streaming_mode:
             fast = self._cached_custom_voice_prompt(info_dict, text, language)
             if fast is not None:
@@ -1684,7 +1706,26 @@ class Qwen3TTSPromptEmbedsBuilder:
                 self.__dict__.setdefault("_cv_fast_keys", {})[(self._speaker_field(info_dict), language)] = cache_key
             talker_prompt = prefix
 
-            if non_streaming_mode:
+            if continuation:
+                ref_code_prompt = self._continuation_ref_code(info_dict, input_ids.device)
+                ref_code_len = int(ref_code_prompt.shape[0])
+                ref_ids = coerce_token_ids(info_dict.pop(PRECOMPUTED_REF_IDS_KEY, None), device=input_ids.device)
+                if ref_ids is None:
+                    ref_text = first_value(info_dict.get("ref_text"))
+                    ref_ids = to_device_nonblocking(
+                        tok(build_ref_text(ref_text), return_tensors="pt", padding=False)["input_ids"],
+                        input_ids.device,
+                    )
+                icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
+                    text_id=input_ids[:, 3:-5],
+                    ref_id=ref_ids[:, 3:-2],
+                    ref_code=ref_code_prompt,
+                    tts_pad_embed=tts_pad_embed,
+                    tts_eos_embed=tts_eos_embed,
+                    non_streaming_mode=non_streaming_mode,
+                )
+                talker_prompt = torch.cat([talker_prompt, icl_input_embed], dim=1)
+            elif non_streaming_mode:
                 text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
                 if text_all is None:
                     text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
@@ -1833,7 +1874,8 @@ class Qwen3TTSPromptEmbedsBuilder:
         if assistant_len < 8:
             raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
 
-        if task_type in ("CustomVoice", "VoiceDesign"):
+        continuation = task_type == "CustomVoice" and _is_custom_voice_continuation(info)
+        if task_type in ("CustomVoice", "VoiceDesign") and not continuation:
             if non_streaming_mode:
                 # model: full text ids (input_ids[:, 3:-5]) + eos + codec_bos step
                 prompt_len += assistant_len - 6
@@ -1841,9 +1883,9 @@ class Qwen3TTSPromptEmbedsBuilder:
                 # model: only first text token in prefill
                 prompt_len += 1
 
-        if task_type == "Base":
+        if task_type == "Base" or continuation:
             xvec_only = bool(_first(info.get("x_vector_only_mode"), False))
-            in_context_mode = not xvec_only
+            in_context_mode = continuation or not xvec_only
 
             voice_clone_prompt = _first(info.get("voice_clone_prompt"), None)
             if isinstance(voice_clone_prompt, dict):
